@@ -22,7 +22,7 @@ Resources:
           yum install -y git
           yum install -y nodejs
           cd /home/ec2-user
-          git clone https://aashah:glpat-ujD9Qhs1SWSyC7DomsD8@git.cs.dal.ca/courses/2024-winter/csci4145-5409/aashah.git
+          git clone https://aashah:[token]@git.cs.dal.ca/courses/2024-winter/csci4145-5409/aashah.git
           cd /home/ec2-user/aashah/Term_Assignment/frontend/
           npm install
           npm start
