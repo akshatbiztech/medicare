@@ -1,0 +1,1337 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Resources:
+  MedicareApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: MediCare
+
+  FrontEndEC2LargeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-051f8a213df8bc089
+      InstanceType: t2.large
+      KeyName: cloudtermassigment
+      SecurityGroups:
+        - Ref: FrontEndEC2LargeInstanceSecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          sudo su
+          yum update -y
+          yum install -y git
+          yum install -y nodejs
+          cd /home/ec2-user
+          git clone https://aashah:glpat-ujD9Qhs1SWSyC7DomsD8@git.cs.dal.ca/courses/2024-winter/csci4145-5409/aashah.git
+          cd /home/ec2-user/aashah/Term_Assignment/frontend/
+          npm install
+          npm start
+
+  FrontEndEC2LargeInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+
+  DynamoDBUserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: user_table
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  DynamoDBDoctorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: doctor_table
+      AttributeDefinitions:
+        - AttributeName: doctor_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: doctor_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  DynamoDBBookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bookings_table
+      AttributeDefinitions:
+        - AttributeName: booking_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: booking_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+  
+  EmailSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: BookingConfirmationTopic
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDynamoDBFullAccess 
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: "*"
+        - PolicyName: LambdaSNSPublishSubscribePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:Subscribe
+                Resource: !Ref EmailSNSTopic 
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AuthLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AuthController
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          EmailSnsTopicArn: !Ref EmailSNSTopic 
+      Code:
+        ZipFile: |
+          import { DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb";
+          import pkg from "@aws-sdk/lib-dynamodb";
+
+          const {
+            DynamoDBDocumentClient,
+            ScanCommand,
+            GetCommand,
+            UpdateCommand,
+            PutCommand,
+          } = pkg;
+          import crypto from "crypto";
+          import {
+            SNSClient,
+            PublishCommand,
+            SubscribeCommand,
+          } from "@aws-sdk/client-sns";
+
+          const sns = new SNSClient({});
+
+          const dynamoDB = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+
+          const table = "user_table";
+
+          export const handler = async (event) => {
+            try {
+              const action = event.data.action;
+              let response;
+
+              switch (action) {
+                case "register":
+                  response = await registerUser(event.data.user);
+                  break;
+                case "login":
+                  const { email, password, role } = event.data.user;
+                  response = await login(email, password, role);
+                  break;
+                default:
+                  response = {
+                    statusCode: 405,
+                    body: JSON.stringify({ message: "Method Not Allowed" }),
+                  };
+              }
+
+              return response;
+            } catch (error) {
+              console.error("Error:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          const registerUser = async (user) => {
+            try {
+              const { name, email, password, role, photo, gender } = user;
+
+              let existingUser =
+                (await role) === "patient"
+                  ? await getUserByEmail(email)
+                  : await getDoctorByEmail(email);
+
+              if (existingUser) {
+                return {
+                  statusCode: 400,
+                  body: JSON.stringify({ message: "User already exists" }),
+                };
+              }
+
+              const hashPassword = crypto
+                .createHash("sha256")
+                .update(password)
+                .digest("hex");
+
+              let params = {
+                TableName: "user_table",
+                Item: {
+                  user_id: email,
+                  name,
+                  email,
+                  password: hashPassword,
+                  role,
+                  photo,
+                  gender,
+                },
+              };
+
+              if (role === "doctor") {
+                params = {
+                  TableName: "doctor_table",
+                  Item: {
+                    doctor_id: email,
+                    name,
+                    email,
+                    password: hashPassword,
+                    role,
+                    photo,
+                    gender,
+                  },
+                };
+              }
+
+              await dynamoDB.send(new PutCommand(params));
+
+              await sns.send(
+                new SubscribeCommand({
+                  Protocol: "email",
+                  TopicArn: process.env.EmailSnsTopicArn,
+                  Endpoint: email,
+                })
+              );
+
+              return {
+                statusCode: 200,
+                body: { success: true, message: "Account successfully created" },
+              };
+            } catch (error) {
+              console.error("Error registering user:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          const login = async (email, password, role) => {
+            try {
+              const user =
+                (await role) === "patient"
+                  ? await getUserByEmail(email)
+                  : await getDoctorByEmail(email);
+
+              if (!user) {
+                return {
+                  statusCode: 400,
+                  body: JSON.stringify({
+                    success: false,
+                    message: "Invalid Credentials",
+                  }),
+                };
+              }
+
+              const hashedPassword = crypto
+                .createHash("sha256")
+                .update(password)
+                .digest("hex");
+
+              if (user.password !== hashedPassword) {
+                return {
+                  statusCode: 400,
+                  body: JSON.stringify({
+                    success: false,
+                    message: "Invalid Credentials",
+                  }),
+                };
+              }
+
+              const { password: _, ...userData } = user;
+
+              return {
+                statusCode: 200,
+                body: { success: true, message: "Successfully login", data: userData },
+              };
+            } catch (error) {
+              console.error("Error logging in:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          const getUserByEmail = async (email) => {
+            try {
+              const params = {
+                TableName: "user_table",
+                Key: {
+                  user_id: email,
+                },
+              };
+
+              const { Item } = await dynamoDB.send(new GetCommand(params));
+
+              return Item;
+            } catch (error) {
+              console.error("Error getting user by email:", error);
+              throw error;
+            }
+          };
+
+          const getDoctorByEmail = async (email) => {
+            try {
+              const params = {
+                TableName: "doctor_table",
+                Key: {
+                  doctor_id: email,
+                },
+              };
+
+              const { Item } = await dynamoDB.send(new GetCommand(params));
+
+              return Item;
+            } catch (error) {
+              console.error("Error getting doctor by email:", error);
+              throw error;
+            }
+          };
+
+  LambdaTestPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref AuthLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/*"
+
+  AuthGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ParentId: !GetAtt MedicareApiGateway.RootResourceId
+      PathPart: auth
+
+  AuthLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AuthLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/POST/auth
+
+  AuthOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref AuthGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              "method.response.header.Access-Control-Allow-Methods": "'GET,POST,PUT,PATCH,DELETE'"
+              "method.response.header.Access-Control-Allow-Origin": "'*'"
+            ResponseTemplates:
+              "application/json": ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": true
+            "method.response.header.Access-Control-Allow-Methods": true
+            "method.response.header.Access-Control-Allow-Origin": true
+          ResponseModels:
+            "application/json": "Empty"
+
+  AuthApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref AuthGatewayResource
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthLambdaFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: "200"
+
+
+  DoctorLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DoctorController
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          EmailSnsTopicArn: !Ref EmailSNSTopic 
+      Code:
+        ZipFile: |
+            // import AWS from "aws-sdk";
+            import { DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb";
+            import pkg from "@aws-sdk/lib-dynamodb";
+            import crypto from "crypto";
+            const {
+              DynamoDBDocumentClient,
+              ScanCommand,
+              GetCommand,
+              UpdateCommand,
+              PutCommand,
+            } = pkg;
+
+            const dynamoDB = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+
+            const table = "doctor_table";
+
+            // const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+            export const handler = async (event) => {
+              try {
+                const operation = event.data.action;
+                let response;
+
+                switch (operation) {
+                  case "registerDoctor":
+                    response = await registerDoctor(event.data.doctor);
+                    break;
+                  case "getAllDoctors":
+                    response = await getAllDoctor();
+                    break;
+                  case "getSingleDoctor":
+                    response = await getSingleDoctor(event.data.id);
+                    break;
+                  case "updateDoctor":
+                    response = await updateDoctor(event.data.email, event.data.doctor);
+                    break;
+                  case "DELETE":
+                    response = await deleteDoctor(event.pathParameters.id);
+                    break;
+                  default:
+                    response = {
+                      statusCode: 405,
+                      body: JSON.stringify({ message: "Method Not Allowed" }),
+                    };
+                }
+
+                return response;
+              } catch (error) {
+                return {
+                  statusCode: 500,
+                  body: JSON.stringify({ message: "Internal Server Error" }),
+                };
+              }
+            };
+
+            // Create new doctor
+            const registerDoctor = async (doctor) => {
+              try {
+                let existingDoctor = await getDoctorByEmail(doctor.email);
+
+                if (existingDoctor) {
+                  return {
+                    statusCode: 400,
+                    body: JSON.stringify({ message: "Doctor already exists" }),
+                  };
+                }
+
+                const hashPassword = crypto
+                  .createHash("sha256")
+                  .update(doctor.email)
+                  .digest("hex");
+
+                const params = {
+                  TableName: table,
+                  Item: {
+                    doctor_id: doctor.email, // Assuming email as the unique identifier for users
+                    password: hashPassword,
+                    ...doctor,
+                  },
+                };
+
+                await dynamoDB.send(new PutCommand(params));
+
+                return {
+                  statusCode: 200,
+                  body: { success: true, message: "User successfully created" },
+                };
+              } catch (error) {
+                console.error("Error registering user:", error);
+                return {
+                  statusCode: 500,
+                  body: JSON.stringify({ message: "Internal Server Error" }),
+                };
+              }
+            };
+
+            const getSingleDoctor = async (id) => {
+              try {
+                const params = {
+                  TableName: table, // Replace with your actual DynamoDB table name
+                  Key: {
+                    doctor_id: id, // Assuming id is the primary key of your DynamoDB table and it's a string
+                  },
+                };
+
+                const { Item } = await dynamoDB.send(new GetCommand(params));
+
+                if (!Item) {
+                  return {
+                    statusCode: 404,
+                    body: JSON.stringify({ message: "Doctor not found" }),
+                  };
+                }
+
+                return {
+                  statusCode: 200,
+                  body: { message: "Success: GET single doctor", doctor: Item },
+                };
+              } catch (error) {
+                console.error("Error retrieving doctor:", error);
+                return {
+                  statusCode: 500,
+                  body: JSON.stringify({ message: "Internal Server Error" }),
+                };
+              }
+            };
+
+            const getAllDoctor = async () => {
+              try {
+                const params = {
+                  TableName: table, // Replace with your actual DynamoDB table name
+                };
+
+                const { Items } = await dynamoDB.send(new ScanCommand(params));
+
+                return {
+                  statusCode: 200,
+                  body: { message: "Success: GET all doctors", doctors: Items },
+                };
+              } catch (error) {
+                console.error("Error retrieving doctors:", error);
+                return {
+                  statusCode: 500,
+                  body: JSON.stringify({ message: "Internal Server Error" }),
+                };
+              }
+            };
+
+            const getDoctorByEmail = async (email) => {
+              try {
+                const params = {
+                  TableName: table,
+                  Key: {
+                    doctor_id: email,
+                  },
+                };
+
+                const { Item } = await dynamoDB.send(new GetCommand(params));
+
+                return Item;
+              } catch (error) {
+                console.error("Error getting user by email:", error);
+                throw error;
+              }
+            };
+
+            const updateDoctor = async (email, doctor) => {
+              try {
+                if (
+                  !doctor ||
+                  typeof doctor !== "object" ||
+                  Object.keys(doctor).length === 0
+                ) {
+                  return {
+                    statusCode: 400,
+                    body: JSON.stringify({
+                      message: "Invalid or empty doctor object provided",
+                    }),
+                  };
+                }
+
+                const params = {
+                  TableName: table,
+                  Key: { doctor_id: email },
+                  UpdateExpression:
+                    "SET " +
+                    Object.keys(doctor)
+                      .map((key) => {
+                        if (Array.isArray(doctor[key])) {
+                          // For list attributes, handle them differently
+                          return `#${key} = list_append(if_not_exists(#${key}, :empty_list), :${key})`;
+                        } else {
+                          return `#${key} = :${key}`;
+                        }
+                      })
+                      .join(", "),
+                  ExpressionAttributeNames: Object.keys(doctor).reduce(
+                    (acc, key) => ({ ...acc, [`#${key}`]: key }),
+                    {}
+                  ),
+                  ExpressionAttributeValues: Object.keys(doctor).reduce((acc, key) => {
+                    if (Array.isArray(doctor[key])) {
+                      // For list attributes, include an empty list to handle if the attribute doesn't exist yet
+                      return { ...acc, [`:${key}`]: doctor[key], ":empty_list": [] };
+                    } else {
+                      return { ...acc, [`:${key}`]: doctor[key] };
+                    }
+                  }, {}),
+                  ReturnValues: "ALL_NEW",
+                };
+
+                const { Attributes } = await dynamoDB.send(new UpdateCommand(params));
+
+                return {
+                  statusCode: 200,
+                  body: { message: "Success: Update single doctor", doctor: Attributes },
+                };
+              } catch (error) {
+                console.error("Error updating doctor:", error);
+                return {
+                  statusCode: 500,
+                  body: { message: "Internal Server Error" },
+                };
+              }
+            };
+
+            const deleteDoctor = async (id) => {
+              // Delete doctor from DynamoDB based on ID
+              return "Success: Delete single doctor";
+            };
+
+  LambdaTestPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref DoctorLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/*"
+
+  DoctorGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ParentId: !GetAtt MedicareApiGateway.RootResourceId
+      PathPart: doctor
+
+  DoctorLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt DoctorLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/POST/doctor
+
+  DoctorOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref DoctorGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              "method.response.header.Access-Control-Allow-Methods": "'GET,POST,PUT,PATCH,DELETE'"
+              "method.response.header.Access-Control-Allow-Origin": "'*'"
+            ResponseTemplates:
+              "application/json": ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": true
+            "method.response.header.Access-Control-Allow-Methods": true
+            "method.response.header.Access-Control-Allow-Origin": true
+          ResponseModels:
+            "application/json": "Empty"
+
+  DoctorApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref DoctorGatewayResource
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DoctorLambdaFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: "200"
+
+  UserLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserController
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          EmailSnsTopicArn: !Ref EmailSNSTopic 
+      Code:
+        ZipFile: |
+          import { DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb";
+          import pkg from "@aws-sdk/lib-dynamodb";
+          import crypto from "crypto";
+
+          const { DynamoDBDocumentClient, ScanCommand, GetCommand, UpdateCommand } = pkg;
+
+          // Initialize DynamoDB Document Client
+          const dynamoDB = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+
+          // Define the DynamoDB table name for users
+          const table = "user_table";
+
+          // Lambda function handler for users
+          export const handler = async (event) => {
+            try {
+              // Extract the action from the event
+              const action = event.data.action;
+              let response;
+
+              // Perform actions based on the action received
+              switch (action) {
+                case "getAllUsers":
+                  response = await getAllUsers();
+                  break;
+                case "getSingleUser":
+                  response = await getSingleUser(event.data.id);
+                  break;
+                case "updateUser":
+                  response = await updateUser(event.data.id, event.data.user);
+                  break;
+                case "deleteUser":
+                  response = await deleteUser(event.data.id);
+                  break;
+                default:
+                  response = {
+                    statusCode: 405,
+                    body: JSON.stringify({ message: "Method Not Allowed" }),
+                  };
+              }
+
+              return response;
+            } catch (error) {
+              console.error("Error:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          // Function to get all users
+          const getAllUsers = async () => {
+            try {
+              const params = {
+                TableName: table,
+              };
+
+              const { Items } = await dynamoDB.send(new ScanCommand(params));
+
+              return {
+                statusCode: 200,
+                body: { message: "Success: GET all users", users: Items },
+              };
+            } catch (error) {
+              console.error("Error retrieving users:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          // Function to get a single user by ID
+          const getSingleUser = async (id) => {
+            try {
+              const params = {
+                TableName: table,
+                Key: { user_id: id },
+              };
+
+              const { Item } = await dynamoDB.send(new GetCommand(params));
+
+              if (!Item) {
+                return {
+                  statusCode: 404,
+                  body: JSON.stringify({ message: "User not found" }),
+                };
+              }
+
+              return {
+                statusCode: 200,
+                body: { message: "Success: GET single user", user: Item },
+              };
+            } catch (error) {
+              console.error("Error retrieving user:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          // Function to update a user by ID
+          const updateUser = async (id, user) => {
+            try {
+              if (!user || typeof user !== "object" || Object.keys(user).length === 0) {
+                return {
+                  statusCode: 400,
+                  body: JSON.stringify({
+                    message: "Invalid or empty user object provided",
+                  }),
+                };
+              }
+
+              const params = {
+                TableName: table,
+                Key: { user_id: id },
+                UpdateExpression:
+                  "SET " +
+                  Object.keys(user)
+                    .map((key) => `#${key} = :${key}`)
+                    .join(", "),
+                ExpressionAttributeNames: Object.keys(user).reduce(
+                  (acc, key) => ({ ...acc, [`#${key}`]: key }),
+                  {}
+                ),
+                ExpressionAttributeValues: Object.keys(user).reduce(
+                  (acc, key) => ({ ...acc, [`:${key}`]: user[key] }),
+                  {}
+                ),
+                ReturnValues: "ALL_NEW",
+              };
+
+              const { Attributes } = await dynamoDB.send(new UpdateCommand(params));
+
+              return {
+                statusCode: 200,
+                body: { message: "Success: Update single user", user: Attributes },
+              };
+            } catch (error) {
+              console.error("Error updating user:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          // Function to delete a user by ID
+          const deleteUser = async (id) => {
+            try {
+              // Your delete logic here
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Success: Delete single user" }),
+              };
+            } catch (error) {
+              console.error("Error deleting user:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+  LambdaTestPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref UserLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/*"
+
+  UserGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ParentId: !GetAtt MedicareApiGateway.RootResourceId
+      PathPart: user
+
+  UserLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt UserLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/POST/user
+
+  UserOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref UserGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              "method.response.header.Access-Control-Allow-Methods": "'GET,POST,PUT,PATCH,DELETE'"
+              "method.response.header.Access-Control-Allow-Origin": "'*'"
+            ResponseTemplates:
+              "application/json": ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": true
+            "method.response.header.Access-Control-Allow-Methods": true
+            "method.response.header.Access-Control-Allow-Origin": true
+          ResponseModels:
+            "application/json": "Empty"
+
+  UserApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref UserGatewayResource
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserLambdaFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: "200"
+  
+  BookingLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BookingController
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          EmailSnsTopicArn: !Ref EmailSNSTopic 
+      Code:
+        ZipFile: |
+          import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
+          import pkg from "@aws-sdk/lib-dynamodb";
+          import crypto from "crypto";
+          const {
+            DynamoDBDocumentClient,
+            ScanCommand,
+            GetCommand,
+            UpdateCommand,
+            PutCommand,
+          } = pkg;
+          import {
+            SNSClient,
+            PublishCommand,
+            SubscribeCommand,
+          } from "@aws-sdk/client-sns";
+
+          const sns = new SNSClient({});
+
+          const dynamoDB = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+
+          const table = "bookings_table";
+
+          function getCurrentTime() {
+            // Create a new Date object
+            const currentTime = new Date();
+
+            // Extract hours, minutes, and seconds
+            const hours = currentTime.getHours();
+            const minutes = currentTime.getMinutes();
+            const seconds = currentTime.getSeconds();
+
+            // Format the time as HH:MM:SS
+            const formattedTime = `${hours}:${minutes}:${seconds}`;
+
+            const hashedTime = crypto
+              .createHash("sha256")
+              .update(formattedTime)
+              .digest("hex");
+
+            return hashedTime;
+          }
+
+          export const handler = async (event) => {
+            try {
+              const action = event.data.action;
+              let response;
+
+              switch (action) {
+                case "getCheckoutSession":
+                  const { doctor_email, user_email, time } = event.data.booking;
+                  response = await getCheckoutSession(doctor_email, user_email, time);
+                  break;
+
+                case "getAllAppointments":
+                  response = await getAllAppointments();
+                  break;
+                default:
+                  response = {
+                    statusCode: 405,
+                    body: JSON.stringify({ message: "Method Not Allowed" }),
+                  };
+              }
+
+              return response;
+            } catch (error) {
+              console.error("Error:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          const getCheckoutSession = async (doctor_email, user_email, time) => {
+            try {
+              const doctor = await getDoctorByEmail(doctor_email);
+              const user = await getUserByEmail(user_email);
+
+              console.log(`Doctor: ${JSON.stringify(doctor)}`);
+              console.log(`User: ${JSON.stringify(user)}`);
+
+              if (!doctor || !user) {
+                return {
+                  statusCode: 400,
+                  body: JSON.stringify({ message: "Error fetching doctor or user" }),
+                };
+              }
+
+              const currentTime = getCurrentTime();
+              const params = {
+                TableName: table,
+                Item: {
+                  booking_id: currentTime,
+                  doctor_email: doctor.email,
+                  user_email: user.email,
+                  time: time,
+                },
+              };
+
+              await dynamoDB.send(new PutCommand(params));
+
+              // Specify the custom email address as the target ARN
+              const sns_params = {
+                Message: `Dear ${user_email}, your booking for ${time} has been confirmed.`,
+                Subject: "Booking Confirmation",
+                TopicArn: process.env.EmailSnsTopicArn, // Replace with your SNS topic ARN
+                MessageAttributes: {
+                  email: {
+                    // Define custom attribute to hold the email address
+                    DataType: "String",
+                    StringValue: user_email, // Pass the custom email address
+                  },
+                },
+              };
+
+              // Publish the message to the SNS topic
+              const sns_res = await sns.send(new PublishCommand(sns_params));
+
+              return {
+                statusCode: 200,
+                body: {
+                  success: true,
+                  message: "Success",
+                  data: params.Item,
+                  sns_response: JSON.stringify(sns_res),
+                },
+              };
+            } catch (error) {
+              console.error("Error creating checkout session:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Error creating checkout session" }),
+              };
+            }
+          };
+
+          const getAllAppointments = async () => {
+            try {
+              const params = {
+                TableName: table,
+                // Replace with your actual DynamoDB table name
+              };
+
+              const { Items } = await dynamoDB.send(new ScanCommand(params));
+
+              return {
+                statusCode: 200,
+                body: { message: "Success: GET all appointments", appointments: Items },
+              };
+            } catch (error) {
+              console.error("Error retrieving appointments:", error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+          const getUserByEmail = async (email) => {
+            try {
+              const params = {
+                TableName: "user_table",
+                Key: {
+                  user_id: email,
+                },
+              };
+
+              const { Item } = await dynamoDB.send(new GetCommand(params));
+
+              return Item;
+            } catch (error) {
+              console.error("Error getting user by email:", error);
+              throw error;
+            }
+          };
+
+          const getDoctorByEmail = async (email) => {
+            try {
+              const params = {
+                TableName: "doctor_table",
+                Key: {
+                  doctor_id: email,
+                },
+              };
+
+              const { Item } = await dynamoDB.send(new GetCommand(params));
+
+              return Item;
+            } catch (error) {
+              console.error("Error getting user by email:", error);
+              throw error;
+            }
+          };
+
+  LambdaTestPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref BookingLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/*"
+
+  BookingGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ParentId: !GetAtt MedicareApiGateway.RootResourceId
+      PathPart: booking
+
+  BookingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt BookingLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MedicareApiGateway}/*/POST/booking
+
+  BookingOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref BookingGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              "method.response.header.Access-Control-Allow-Methods": "'GET,POST,PUT,PATCH,DELETE'"
+              "method.response.header.Access-Control-Allow-Origin": "'*'"
+            ResponseTemplates:
+              "application/json": ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": true
+            "method.response.header.Access-Control-Allow-Methods": true
+            "method.response.header.Access-Control-Allow-Origin": true
+          ResponseModels:
+            "application/json": "Empty"
+
+  BookingApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+      ResourceId: !Ref BookingGatewayResource
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingLambdaFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: $input.json('$')
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: $input.json('$')
+      RequestParameters:
+        method.request.querystring.name: false
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: "200"
+
+  MedicareApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - AuthApiGatewayMethod
+      - DoctorApiGatewayMethod
+      - BookingApiGatewayMethod
+      - UserApiGatewayMethod
+      - BookingOptionsMethod
+      - AuthOptionsMethod
+      - UserOptionsMethod
+      - DoctorOptionsMethod
+    Properties:
+      RestApiId: !Ref MedicareApiGateway
+
+  MedicareApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref MedicareApiGatewayDeployment
+      RestApiId: !Ref MedicareApiGateway
+      StageName: prod   
+
+  MedicareSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: ProdApiGatewayUrl
+      Description: URL for Prod API Gateway
+      SecretString:
+        Fn::Join:
+          - ""
+          - - "https://"
+            - !Ref MedicareApiGateway
+            - ".execute-api."
+            - !Ref "AWS::Region"
+            - ".amazonaws.com/prod"    
+Outputs:
+  EC2InstancePublicIP:
+    Value: !GetAtt FrontEndEC2LargeInstance.PublicIp
+    Export:
+      Name: medicare-url
